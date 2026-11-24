@@ -1,0 +1,464 @@
+import json
+import logging
+import os
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI, HTTPException, status
+from fastapi.testclient import TestClient
+
+import backend.main as main_app
+import backend.routes.jobs as jobs_route
+import backend.routes.search as search_route
+import backend.routes.upload_resume as upload_route
+from backend.routes.jobs import router as jobs_router
+from backend.routes.search import router as search_router
+from backend.routes.upload_resume import router as upload_router
+
+
+class FakeCursor:
+    def __init__(self, docs: list[dict]):
+        self._docs = list(docs)
+        self._skip = 0
+        self._limit: int | None = None
+
+    def skip(self, amount: int) -> "FakeCursor":
+        self._skip = amount
+        return self
+
+    def limit(self, amount: int) -> "FakeCursor":
+        self._limit = amount
+        return self
+
+    def __iter__(self) -> Iterator[dict]:
+        window = self._docs[self._skip :]
+        if self._limit is not None:
+            window = window[: self._limit]
+        return iter(window)
+
+
+class FakeCollection:
+    def __init__(self, docs: list[dict]):
+        self._docs = list(docs)
+
+    def find(self, _query: dict | None = None, projection: dict | None = None) -> FakeCursor:
+        projected_docs: list[dict] = []
+        for original in self._docs:
+            row = dict(original)
+            if projection and projection.get("_id") == 0:
+                row.pop("_id", None)
+            projected_docs.append(row)
+        return FakeCursor(projected_docs)
+
+    def count_documents(self, _query: dict | None = None) -> int:
+        return len(self._docs)
+
+
+class BrokenCollection:
+    def find(self, *_args, **_kwargs):
+        raise RuntimeError("db read failed")
+
+    def count_documents(self, *_args, **_kwargs):
+        raise RuntimeError("db count failed")
+
+
+@pytest.fixture
+def client() -> Iterator[TestClient]:
+    app = FastAPI()
+    app.include_router(jobs_router)
+    app.include_router(search_router)
+    app.include_router(upload_router)
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+def _job_doc(index: int) -> dict:
+    return {
+        "_id": f"id-{index}",
+        "title": f"Backend Engineer {index}",
+        "company": f"Company {index}",
+        "location": "Remote",
+        "skills": ["Python", "FastAPI"],
+        "experience_level": 3,
+    }
+
+
+def _search_payload() -> dict:
+    return {
+        "job_title": "Backend Engineer",
+        "skills": ["Python", "FastAPI"],
+        "location": "Remote",
+        "experience_level": 3,
+    }
+
+
+def _load_200_job_corpus() -> list[dict]:
+    corpus_path = Path(__file__).resolve().parents[1] / "seed_jobs_200.json"
+    return json.loads(corpus_path.read_text(encoding="utf-8"))
+
+
+def test_backend_cors_allows_frontend_dev_origin() -> None:
+    client = TestClient(main_app.app)
+
+    response = client.options(
+        "/search",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Content-Type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert "POST" in response.headers["access-control-allow-methods"]
+    assert "content-type" in response.headers["access-control-allow-headers"].lower()
+    assert "*" not in main_app.origins
+
+
+def test_backend_cors_rejects_unconfigured_origin() -> None:
+    client = TestClient(main_app.app)
+
+    response = client.options(
+        "/search",
+        headers={
+            "Origin": "https://untrusted.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_backend_cors_parser_ignores_wildcard_origin() -> None:
+    assert main_app._parse_cors_origins("*, http://localhost:5173") == [
+        "http://localhost:5173"
+    ]
+
+
+def test_search_happy_path_returns_ranked_results(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_collection = FakeCollection([_job_doc(i) for i in range(40)])
+    monkeypatch.setattr(search_route, "get_jobs_collection", lambda: fake_collection)
+
+    response = client.post("/search", json=_search_payload())
+    assert response.status_code == 200
+
+    body = response.json()
+    assert len(body["results"]) == 20
+    scores = [job["score"] for job in body["results"]]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_search_response_time_against_200_job_corpus(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs = _load_200_job_corpus()
+    assert len(jobs) == 200
+
+    fake_collection = FakeCollection(jobs)
+    monkeypatch.setattr(search_route, "get_jobs_collection", lambda: fake_collection)
+
+    payload = {
+        "job_title": "Backend Engineer",
+        "skills": ["Python", "FastAPI", "SQL", "Docker", "Kubernetes"],
+        "location": "Remote",
+        "experience_level": 3,
+    }
+
+    warmup_response = client.post("/search", json=payload)
+    assert warmup_response.status_code == 200
+
+    max_seconds = float(os.getenv("SEARCH_200_JOB_MAX_SECONDS", "6.0"))
+    started_at = time.perf_counter()
+    response = client.post("/search", json=payload)
+    elapsed_seconds = time.perf_counter() - started_at
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["results"]) == 20
+    scores = [job["score"] for job in body["results"]]
+    assert scores == sorted(scores, reverse=True)
+    assert elapsed_seconds < max_seconds, (
+        f"POST /search took {elapsed_seconds:.3f}s for 200 jobs; "
+        f"expected under {max_seconds:.3f}s"
+    )
+
+
+def test_search_caps_candidates_to_200_and_returns_top_20_sorted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_collection = FakeCollection([_job_doc(i) for i in range(260)])
+    monkeypatch.setattr(search_route, "get_jobs_collection", lambda: fake_collection)
+
+    captured: dict[str, int] = {}
+
+    def fake_rank_jobs(_search_request, jobs, top_n=10):  # noqa: ARG001
+        captured["candidate_count"] = len(jobs)
+        captured["top_n"] = top_n
+        # Intentionally unsorted by score to verify route-level sorting.
+        return [
+            {
+                **job,
+                "matched_skills": [],
+                "score": float((index % 9) / 10.0),
+            }
+            for index, job in enumerate(jobs)
+        ]
+
+    monkeypatch.setattr(search_route, "rank_jobs", fake_rank_jobs)
+
+    response = client.post("/search", json=_search_payload())
+    assert response.status_code == 200
+
+    body = response.json()
+    assert captured["candidate_count"] == 200
+    assert captured["top_n"] == 200
+    assert len(body["results"]) == 20
+    scores = [job["score"] for job in body["results"]]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_search_empty_result_when_no_jobs(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_collection = FakeCollection([])
+    monkeypatch.setattr(search_route, "get_jobs_collection", lambda: fake_collection)
+
+    response = client.post("/search", json=_search_payload())
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+
+
+def test_search_returns_422_for_invalid_payload(client: TestClient) -> None:
+    payload = {
+        "job_title": "   ",
+        "skills": [],
+        "location": "Remote",
+        "experience_level": 3,
+    }
+    response = client.post("/search", json=payload)
+    assert response.status_code == 422
+    detail_text = str(response.json().get("detail", ""))
+    assert "skills" in detail_text or "job_title" in detail_text
+
+
+def test_search_returns_422_for_oversized_payload(client: TestClient) -> None:
+    payload = {
+        "job_title": "Backend Engineer",
+        "skills": [f"Skill {index}" for index in range(26)],
+        "location": "Remote",
+        "experience_level": 3,
+    }
+
+    response = client.post("/search", json=payload)
+
+    assert response.status_code == 422
+    assert "skills" in str(response.json().get("detail", ""))
+
+
+def test_search_returns_400_for_value_error_from_ranker(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_collection = FakeCollection([_job_doc(1)])
+    monkeypatch.setattr(search_route, "get_jobs_collection", lambda: fake_collection)
+
+    def raise_value_error(*_args, **_kwargs):
+        raise ValueError("bad ranking input")
+
+    monkeypatch.setattr(search_route, "rank_jobs", raise_value_error)
+
+    response = client.post("/search", json=_search_payload())
+    assert response.status_code == 400
+    assert "Invalid search input" in response.json()["detail"]
+
+
+def test_search_returns_500_and_logs_when_ranker_fails(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_collection = FakeCollection([_job_doc(1)])
+    monkeypatch.setattr(search_route, "get_jobs_collection", lambda: fake_collection)
+
+    def raise_runtime_error(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(search_route, "rank_jobs", raise_runtime_error)
+
+    with caplog.at_level(logging.ERROR):
+        response = client.post("/search", json=_search_payload())
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to rank jobs."
+    assert any(
+        "Unexpected ranking failure in /search" in record.message
+        for record in caplog.records
+    )
+
+
+def test_search_returns_500_and_logs_when_db_read_fails(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(search_route, "get_jobs_collection", lambda: BrokenCollection())
+
+    with caplog.at_level(logging.ERROR):
+        response = client.post("/search", json=_search_payload())
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to fetch jobs from the database."
+    assert any(
+        "Failed to read jobs from MongoDB for /search" in record.message
+        for record in caplog.records
+    )
+
+
+def test_jobs_happy_path_returns_page_window(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_collection = FakeCollection([_job_doc(i) for i in range(25)])
+    monkeypatch.setattr(jobs_route, "get_jobs_collection", lambda: fake_collection)
+
+    response = client.get("/jobs?page=2&limit=10")
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["page"] == 2
+    assert body["limit"] == 10
+    assert body["total"] == 25
+    assert len(body["results"]) == 10
+
+
+def test_jobs_empty_result_set(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_collection = FakeCollection([])
+    monkeypatch.setattr(jobs_route, "get_jobs_collection", lambda: fake_collection)
+
+    response = client.get("/jobs?page=1&limit=20")
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["total"] == 0
+    assert body["results"] == []
+
+
+def test_jobs_returns_422_for_invalid_query(client: TestClient) -> None:
+    assert client.get("/jobs?page=0&limit=20").status_code == 422
+    assert client.get("/jobs?page=1&limit=101").status_code == 422
+
+
+def test_jobs_returns_500_and_logs_when_db_fails(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(jobs_route, "get_jobs_collection", lambda: BrokenCollection())
+
+    with caplog.at_level(logging.ERROR):
+        response = client.get("/jobs?page=1&limit=20")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to fetch jobs from the database."
+    assert any(
+        "Failed to fetch paginated jobs for /jobs" in record.message
+        for record in caplog.records
+    )
+
+
+def test_upload_resume_happy_path(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parsed_profile = {
+        "job_title": "Backend Engineer",
+        "skills": ["Python", "FastAPI"],
+        "location": "Remote",
+        "experience_level": 3,
+    }
+
+    monkeypatch.setattr(
+        upload_route,
+        "parse_resume_upload",
+        lambda _filename, _bytes: (
+            parsed_profile,
+            "Backend Engineer Python FastAPI",
+        ),
+    )
+
+    response = client.post(
+        "/upload-resume",
+        files={"file": ("resume.pdf", b"fake bytes", "application/pdf")},
+    )
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["filename"] == "resume.pdf"
+    assert body["extracted_text_preview"] == "Backend Engineer Python FastAPI"
+    assert body["profile"] == parsed_profile
+
+
+def test_upload_resume_returns_400_when_no_text_extractable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def raise_no_text_error(_filename: str, _file_bytes: bytes):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Could not extract text from uploaded resume.",
+        )
+
+    monkeypatch.setattr(upload_route, "parse_resume_upload", raise_no_text_error)
+
+    response = client.post(
+        "/upload-resume",
+        files={"file": ("resume.docx", b"fake bytes", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Could not extract text from uploaded resume."
+
+
+def test_upload_resume_returns_415_for_unsupported_extension(client: TestClient) -> None:
+    response = client.post(
+        "/upload-resume",
+        files={"file": ("resume.txt", b"hello", "text/plain")},
+    )
+    assert response.status_code == 415
+    assert "Unsupported file type" in response.json()["detail"]
+
+
+def test_upload_resume_returns_400_for_empty_file(client: TestClient) -> None:
+    response = client.post(
+        "/upload-resume",
+        files={"file": ("resume.pdf", b"", "application/pdf")},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Uploaded file is empty."
+
+
+def test_upload_resume_returns_500_and_logs_on_parser_error(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def raise_parser_error(_filename: str, _file_bytes: bytes):
+        raise RuntimeError("parser crashed")
+
+    monkeypatch.setattr(upload_route, "parse_resume_upload", raise_parser_error)
+    with caplog.at_level(logging.ERROR):
+        response = client.post(
+            "/upload-resume",
+            files={"file": ("resume.pdf", b"fake bytes", "application/pdf")},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to parse uploaded resume."
+    assert any(
+        "Resume parsing failed for file" in record.message
+        for record in caplog.records
+    )
